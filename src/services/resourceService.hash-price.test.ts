@@ -79,6 +79,8 @@ describe("resourceService Hashing and Price logic", () => {
         price,
         walletAddress: "GBX402...",
         resourceType: "file",
+        storagePath: null,
+        externalUrl: null,
         mimeType: "text/csv",
         contentHash: expectedHash,
       });
@@ -126,6 +128,7 @@ describe("resourceService Hashing and Price logic", () => {
         price,
         walletAddress: "GBX402...",
         resourceType: "link",
+        storagePath: null,
         externalUrl,
         contentHash: expectedHash,
       });

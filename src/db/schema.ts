@@ -111,6 +111,13 @@ export const resources = pgTable(
     description: text("description"),
     price: text("price").notNull(),
     walletAddress: text("wallet_address").notNull(),
+    // A resource's type and backing location must agree (#175). There are
+    // exactly three valid shapes (documented in docs/resource-lifecycle.md):
+    //   staged file    — file / storage_path NULL / external_url NULL
+    //   finalized file — file / storage_path set / external_url NULL
+    //   link           — link / storage_path NULL / external_url set
+    // `storagePath` is nullable only so an upload can pass through the staged
+    // shape before its object is written; a link is created already finalized.
     resourceType: resourceTypeEnum("resource_type").notNull(),
     storagePath: text("storage_path"),
     thumbnailPath: text("thumbnail_path"),
@@ -197,6 +204,18 @@ export const resources = pgTable(
     sizeBytesNonNegative: check(
       "resources_size_bytes_nonneg",
       sql`${table.sizeBytes} IS NULL OR ${table.sizeBytes} >= 0`,
+    ),
+    // #175: enforce the documented resource shapes in Postgres so no caller can
+    // persist an impossible combination (e.g. a link with a stored object, or a
+    // file with an external URL). The first branch is the short-lived staged
+    // upload state; the other two are finalized rows.
+    backingShapeValid: check(
+      "resources_backing_shape_valid",
+      sql`(
+        (${table.resourceType} = 'file' AND ${table.storagePath} IS NULL AND ${table.externalUrl} IS NULL)
+        OR (${table.resourceType} = 'file' AND ${table.storagePath} IS NOT NULL AND ${table.externalUrl} IS NULL)
+        OR (${table.resourceType} = 'link' AND ${table.storagePath} IS NULL AND ${table.externalUrl} IS NOT NULL)
+      )`,
     ),
   }),
 );

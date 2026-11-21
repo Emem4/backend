@@ -478,6 +478,9 @@ export async function createFileResource(data: {
 
   let resource: typeof resources.$inferSelect;
   try {
+    // Stage the upload (#175): a file row starts with both backing locations
+    // empty. This is the one transitional shape the Postgres check allows;
+    // it is finalized by setting storage_path below, or removed on failure.
     [resource] = await db
       .insert(resources)
       .values({
@@ -487,6 +490,8 @@ export async function createFileResource(data: {
         price: data.price,
         walletAddress: data.walletAddress,
         resourceType: "file",
+        storagePath: null,
+        externalUrl: null,
         mimeType: data.mimeType,
         contentHash,
         sizeBytes,
@@ -531,6 +536,8 @@ export async function createFileResource(data: {
     );
   });
 
+  // Promote the staged row to a finalized file row (#175): storage_path is
+  // now set while external_url stays NULL, satisfying the DB invariant.
   const [updated] = await db
     .update(resources)
     .set({ storagePath })
@@ -568,6 +575,8 @@ export async function createLinkResource(data: {
   walletAddress: string;
   externalUrl: string;
 }) {
+  // Links have no upload stage (#175): they are born finalized, with an
+  // external URL and no storage path.
   const [resource] = await db
     .insert(resources)
     .values({
@@ -577,6 +586,7 @@ export async function createLinkResource(data: {
       price: data.price,
       walletAddress: data.walletAddress,
       resourceType: "link",
+      storagePath: null,
       externalUrl: data.externalUrl,
       contentHash: hashLinkResource(data.externalUrl, data.title),
     })
@@ -906,4 +916,130 @@ export async function getResourceMeta(
 /**
  * Delist a resource: flip `listed` to false in Postgres, drop stored files, and
  * (issue #218) sync the change on-chain so the vault registry's `listed` flag
+ * matches the API.
  *
+ * The on-chain delist is best-effort and never blocks the DB delist:
+ *  - Resources that were never registered on-chain (`onchainStatus !==
+ *    "registered"`) skip the chain call entirely and delist cleanly.
+ *  - If the on-chain call fails, the DB delist still stands and the failure is
+ *    logged for reconciliation rather than surfaced to the caller.
+ *
+ * `onChainDelist` is injectable so tests can assert both paths without touching
+ * Soroban; it defaults to the real registry-signed delist.
+ */
+export async function delistResource(
+  id: string,
+  publisherId: string,
+  // Injectable for tests. Left out, it lazily loads the real registry-signed
+  // delist; the lazy import keeps `resourceService` free of a load-time Stellar
+  // client so unrelated tests don't need to mock the registry.
+  onChainDelist?: (resourceId: string) => Promise<{ success: boolean; error?: string }>,
+) {
+  const [resource] = await db
+    .update(resources)
+    .set({ listed: false })
+    .where(and(eq(resources.id, id), eq(resources.publisherId, publisherId)))
+    .returning();
+
+  if (!resource) return null;
+
+  invalidateReads(resource.id);
+
+  void enqueueWebhookEvent(resource.publisherId, "resource.delisted", {
+    resourceId: resource.id,
+    title: resource.title,
+  });
+
+  // Storage cleanup is best-effort: the DB delist already stands, so a failed
+  // delete must not surface as an error to the caller (issue #87). Log the
+  // failure and queue a retry so the orphaned object is removed later.
+  for (const path of [resource.storagePath, resource.thumbnailPath]) {
+    if (!path) continue;
+    try {
+      await deleteFile(path);
+    } catch (err) {
+      const { getLogger } = await import("../lib/logger.js");
+      getLogger().error(
+        {
+          event: "delist_storage_cleanup_failed",
+          resourceId: resource.id,
+          storagePath: path,
+          err,
+        },
+        "failed to delete stored file during delist; queued for retry",
+      );
+      try {
+        await enqueueStorageCleanup({ resourceId: resource.id, storagePath: path });
+      } catch (queueErr) {
+        getLogger().error(
+          { event: "delist_storage_cleanup_enqueue_failed", resourceId: resource.id, storagePath: path, err: queueErr },
+          "failed to enqueue storage cleanup retry",
+        );
+      }
+    }
+  }
+
+  // Only registered resources exist on-chain; anything else delists DB-only.
+  if (resource.onchainStatus === "registered") {
+    const { getLogger } = await import("../lib/logger.js");
+    try {
+      const delist = onChainDelist ?? (await import("./registryClient.js")).delistOnChain;
+      const result = await delist(resource.id);
+      if (!result.success) {
+        getLogger().warn(
+          { event: "delist_onchain_sync", resourceId: resource.id, error: result.error },
+          "DB delist succeeded but on-chain delist failed; chain state may be stale",
+        );
+      }
+    } catch (err) {
+      getLogger().error(
+        { event: "delist_onchain_sync", resourceId: resource.id, err },
+        "unexpected error during on-chain delist sync",
+      );
+    }
+  }
+
+  return resource;
+}
+
+export async function getVerificationDetails(resourceId: string) {
+  const resource = await db
+    .select({
+      id: resources.id,
+      title: resources.title,
+      verificationStatus: resources.verificationStatus,
+      verificationId: resources.verificationId,
+      listed: resources.listed,
+      createdAt: resources.createdAt,
+    })
+    .from(resources)
+    .where(eq(resources.id, resourceId))
+    .then((rows) => rows[0] ?? null);
+
+  if (!resource) return null;
+
+  let verification = null;
+  if (resource.verificationId) {
+    verification = await db
+      .select()
+      .from(verifications)
+      .where(eq(verifications.id, resource.verificationId))
+      .then((rows) => rows[0] ?? null);
+  }
+
+  return {
+    resourceId: resource.id,
+    title: resource.title,
+    status: resource.verificationStatus,
+    listed: resource.listed,
+    publishedAt: resource.createdAt,
+    verification: verification
+      ? {
+          isOriginal: verification.isOriginal,
+          confidence: verification.confidence,
+          flags: verification.flags ? JSON.parse(verification.flags) : [],
+          checkedAt: verification.checkedAt,
+        }
+      : null,
+  };
+}
