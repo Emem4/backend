@@ -19,6 +19,10 @@ import {
   startIdempotencyCleanupWorker,
   stopIdempotencyCleanupWorker,
 } from "./workers/idempotencyCleanupWorker.js";
+import {
+  startUploadTempSweepWorker,
+  stopUploadTempSweepWorker,
+} from "./workers/uploadTempSweepWorker.js";
 import { createPostgresRowStore, type PgSql } from "./lib/idempotencyPgStore.js";
 import { closeRateLimitStore } from "./lib/rateLimit/index.js";
 import { closeSignatureReplayStore } from "./middleware/requestSignatureAuth.js";
@@ -88,6 +92,9 @@ function startWorkers(): void {
   // be tested with a fake; only the elected leader runs it.
   const idempotencyRows = createPostgresRowStore(pgClient as unknown as PgSql);
   startIdempotencyCleanupWorker((batchSize) => idempotencyRows.deleteExpired(batchSize));
+  // Reclaim upload temp files orphaned by process crashes; the sweep only
+  // removes stale files inside the dedicated upload temp directory.
+  startUploadTempSweepWorker();
   startLeaderHealthCheck();
 }
 
@@ -99,6 +106,7 @@ function stopWorkers(): void {
   stopEventListener();
   stopWebhookOutboxWorker();
   stopIdempotencyCleanupWorker();
+  stopUploadTempSweepWorker();
   rootLogger.info({ event: "workers_stopped" }, "background workers stopped");
 }
 

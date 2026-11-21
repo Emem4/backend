@@ -281,6 +281,14 @@ export const envSchema = z.object({
     .default(
       "application/pdf,image/png,image/jpeg,image/gif,image/webp,text/plain,text/markdown,application/json,application/zip,video/mp4,audio/mpeg",
     ),
+  // Dedicated directory for multer disk-staged upload temp files. Defaults to
+  // a subdirectory of the OS temp dir so the crash-recovery sweep can tell
+  // app-owned files apart from unrelated temp files.
+  UPLOAD_TEMP_DIR: z.string().min(1).optional(),
+  // A temp file is only swept once its mtime is older than this, so uploads
+  // still in flight are never removed.
+  UPLOAD_TEMP_MAX_AGE_MS: z.coerce.number().int().min(60_000).max(604_800_000).default(3_600_000),
+  UPLOAD_TEMP_SWEEP_INTERVAL_MS: z.coerce.number().int().min(10_000).max(3_600_000).default(300_000),
 
   // Soroban registry
   REGISTRY_CONTRACT_ID: stellarContract("REGISTRY_CONTRACT_ID / VAULT_REGISTRY_CONTRACT_ID"),

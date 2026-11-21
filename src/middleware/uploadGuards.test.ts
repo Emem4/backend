@@ -1,7 +1,9 @@
-import { describe, it, expect, beforeAll, vi } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
 import express, { type Express } from "express";
 import request from "supertest";
 import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 // uploadGuards imports config; mock it so the test doesn't need a full env.
 vi.mock("../config.js", () => ({
@@ -20,6 +22,7 @@ vi.mock("../lib/logger.js", async (importOriginal) => ({
 import {
   singleFileUpload,
   validateUploadContentType,
+  sweepStaleUploadTempFiles,
   __getActiveUploadCount,
 } from "./uploadGuards.js";
 import { errorHandler } from "./errorHandler.js";
@@ -202,5 +205,54 @@ describe("upload guards middleware", () => {
     expect(responses.some((res) => res.status === 503)).toBe(true);
     expect(maxObserved).toBeLessThanOrEqual(6);
     expect(__getActiveUploadCount()).toBe(0);
+  });
+});
+
+describe("sweepStaleUploadTempFiles", () => {
+  let dir: string;
+  let outsideDir: string;
+
+  beforeAll(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "upload-sweep-test-"));
+    outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), "upload-sweep-outside-"));
+  });
+
+  afterAll(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(outsideDir, { recursive: true, force: true });
+  });
+
+  function makeFile(dirPath: string, name: string, ageMs: number): string {
+    const filePath = path.join(dirPath, name);
+    fs.writeFileSync(filePath, "x");
+    const past = new Date(Date.now() - ageMs);
+    fs.utimesSync(filePath, past, past);
+    return filePath;
+  }
+
+  it("removes only stale files inside the upload temp dir", async () => {
+    const stale = makeFile(dir, "stale-1", 10_000);
+    const fresh = makeFile(dir, "fresh-1", 1_000); // newer than maxAgeMs
+    const outside = makeFile(outsideDir, "outside-1", 10_000);
+    const subdir = path.join(dir, "nested");
+    fs.mkdirSync(subdir);
+    const nested = makeFile(subdir, "nested-1", 10_000);
+
+    const result = await sweepStaleUploadTempFiles({ dir, maxAgeMs: 5_000 });
+
+    expect(result).toEqual({ scanned: 2, removed: 1, keptActive: 1, errors: 0 });
+    expect(fs.existsSync(stale)).toBe(false);
+    expect(fs.existsSync(fresh)).toBe(true);
+    // Unrelated temp files and subdirectories are never touched.
+    expect(fs.existsSync(outside)).toBe(true);
+    expect(fs.existsSync(nested)).toBe(true);
+  });
+
+  it("returns zero counts when the directory does not exist", async () => {
+    const result = await sweepStaleUploadTempFiles({
+      dir: path.join(dir, "does-not-exist"),
+      maxAgeMs: 5_000,
+    });
+    expect(result).toEqual({ scanned: 0, removed: 0, keptActive: 0, errors: 0 });
   });
 });
