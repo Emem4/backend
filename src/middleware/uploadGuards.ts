@@ -2,6 +2,7 @@ import multer, { MulterError } from "multer";
 import type { Request, Response, NextFunction, RequestHandler } from "express";
 import { promises as fs } from "node:fs";
 import os from "node:os";
+import path from "node:path";
 import { config } from "../config.js";
 import { AppError } from "../lib/errors.js";
 import { parseAllowedMimeTypes, validateUpload } from "../lib/uploadValidation.js";
@@ -10,6 +11,18 @@ const allowedMimeTypes = parseAllowedMimeTypes(config.ALLOWED_UPLOAD_MIME_TYPES)
 
 const maxConcurrentUploads = config.MAX_CONCURRENT_UPLOADS ?? 4;
 let activeUploads = 0;
+
+/**
+ * Upload temp files live in a dedicated app-owned directory rather than the
+ * shared os.tmpdir(), so the crash-recovery sweep can distinguish our files
+ * from unrelated temp files and never touches anything outside this dir.
+ */
+export const UPLOAD_TEMP_DIR =
+  config.UPLOAD_TEMP_DIR ?? path.join(os.tmpdir(), "synapsvault-uploads");
+
+// Create the directory eagerly so the first upload (and the sweep worker)
+// never races its creation.
+void fs.mkdir(UPLOAD_TEMP_DIR, { recursive: true }).catch(() => undefined);
 
 /** Test hook: number of uploads currently holding a concurrency slot. */
 export function __getActiveUploadCount(): number {
@@ -25,7 +38,14 @@ const MAX_MULTIPART_PARTS = MAX_MULTIPART_FIELDS + 2;
 const MAX_MULTIPART_FIELD_SIZE = 8 * 1024;
 
 const upload = multer({
-  storage: multer.diskStorage({ destination: os.tmpdir() }),
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => {
+      fs.mkdir(UPLOAD_TEMP_DIR, { recursive: true }).then(
+        () => cb(null, UPLOAD_TEMP_DIR),
+        (err: unknown) => cb(err as Error, ""),
+      );
+    },
+  }),
   limits: {
     fileSize: config.MAX_FILE_SIZE_MB * 1024 * 1024,
     fields: MAX_MULTIPART_FIELDS,
@@ -211,4 +231,62 @@ export function validateUploadContentType(req: Request, res: Response, next: Nex
     .catch((err: unknown) => {
       fs.unlink(file.path).catch(() => undefined).finally(() => next(err));
     });
+}
+
+export interface UploadTempSweepResult {
+  /** Entries examined inside the upload temp directory. */
+  scanned: number;
+  /** Stale owned files removed. */
+  removed: number;
+  /** Files kept because their mtime is newer than the max age (in-flight uploads). */
+  keptActive: number;
+  /** Entries that could not be stat'ed or unlinked; the sweep continues past them. */
+  errors: number;
+}
+
+/**
+ * Removes stale temp files left behind when a process crash bypasses request
+ * cleanup. Only regular files directly inside the dedicated upload temp dir
+ * are considered, and only once their mtime is older than `maxAgeMs` — so
+ * active uploads (fresh mtimes) and anything outside the dir are never
+ * touched. Returns per-run counts for logging/metrics.
+ */
+export async function sweepStaleUploadTempFiles(
+  options: { dir?: string; maxAgeMs?: number; now?: number } = {},
+): Promise<UploadTempSweepResult> {
+  const dir = options.dir ?? UPLOAD_TEMP_DIR;
+  const maxAgeMs = options.maxAgeMs ?? config.UPLOAD_TEMP_MAX_AGE_MS ?? 3_600_000;
+  const now = options.now ?? Date.now();
+  const result: UploadTempSweepResult = { scanned: 0, removed: 0, keptActive: 0, errors: 0 };
+
+  let entries;
+  try {
+    entries = await fs.readdir(dir, { withFileTypes: true });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return result;
+    throw err;
+  }
+
+  await Promise.all(
+    entries.map(async (entry) => {
+      // Never recurse into subdirectories or follow symlinks — only plain
+      // files the multer diskStorage wrote are eligible for removal.
+      if (!entry.isFile()) return;
+      result.scanned += 1;
+      const filePath = path.join(dir, entry.name);
+      try {
+        const stat = await fs.stat(filePath);
+        if (now - stat.mtimeMs < maxAgeMs) {
+          result.keptActive += 1;
+          return;
+        }
+        await fs.unlink(filePath);
+        result.removed += 1;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") result.errors += 1;
+      }
+    }),
+  );
+
+  return result;
 }
