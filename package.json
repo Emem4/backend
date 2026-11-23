@@ -46,7 +46,7 @@
   "author": "mano.dev",
   "license": "MIT",
   "dependencies": {
-    "@opentelemetry/api": "^1.9.0",
+    "@opentelemetry/api": "^1.10.0",
     "@opentelemetry/exporter-trace-otlp-http": "^0.301.2",
     "@opentelemetry/instrumentation-express": "^0.57.0",
     "@opentelemetry/exporter-trace-otlp-http": "^0.217.0",
