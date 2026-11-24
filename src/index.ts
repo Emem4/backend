@@ -3,6 +3,7 @@
 // (see package.json) would guarantee strict ordering; this is the pragmatic
 // version for a `tsx`-run dev/prod entrypoint.
 import "./tracing.js";
+import { shutdownTracing } from "./tracing.js";
 import type { Server } from "node:http";
 import { config } from "./config.js";
 import { captureServerException } from "./lib/sentry.js";
@@ -259,6 +260,10 @@ async function gracefulShutdown(signal: string): Promise<void> {
     await closeSignatureReplayStore();
     await releaseWorkerLeaderLock();
     await pgClient.end({ timeout: 5 });
+    // Flush all buffered OpenTelemetry spans before exiting (#218).
+    // This runs inside the remaining shutdown budget; shutdownTracing() is
+    // self-bounded so a hung exporter cannot prevent process exit.
+    await shutdownTracing();
     const forced = timedOut && inFlightCount() > 0;
     rootLogger.info({ event: "shutdown_complete", signal, forced }, "graceful shutdown complete");
     process.exit(forced ? 1 : 0);
