@@ -23,7 +23,7 @@ import {
 } from "../services/publisherService.js";
 import { deliver, webhookUrlProblem } from "../services/webhookService.js";
 import { replayWebhookDelivery } from "../workers/webhookOutboxWorker.js";
-import { eq, and, isNull, inArray, sum, count, sql, desc } from "drizzle-orm";
+import { eq, and, isNull, inArray, sum, count, sql, desc, or, lt, lte } from "drizzle-orm";
 import { db } from "../db/client.js";
 import { publishers, resources, payments, webhookOutbox } from "../db/schema.js";
 import { config } from "../config.js";
@@ -386,12 +386,79 @@ router.post("/publishers/me/webhooks/test", apiKeyAuth, publisherRateLimit, asyn
   res.status(result.delivered ? 200 : 502).json(result);
 });
 
-// GET /publishers/me/webhooks/deliveries — recent outbox deliveries (#48)
-// Publishers can list recent webhook deliveries (up to 100) to inspect status,
-// errors, and retry counts.
+// GET /publishers/me/webhooks/deliveries — recent outbox deliveries (#48, #221)
+// Publishers can paginate through webhook deliveries ordered by (createdAt DESC, id DESC).
+//
+// Query parameters:
+//   limit  (1–100, default 20)
+//   after  opaque cursor from a previous response
+//
+// Response:
+//   { deliveries: DeliveryRow[], nextCursor: string|null, hasNextPage: boolean }
+//
+// Cursors are publisher-scoped: a cursor minted by another publisher's response
+// will not expose that publisher's rows — it will return the requesting
+// publisher's own rows starting from that (createdAt, id) position, which is
+// harmless.  Structurally invalid cursors return a 400 VALIDATION_ERROR.
 router.get("/publishers/me/webhooks/deliveries", apiKeyAuth, publisherRateLimit, async (req, res) => {
   const pub = req.publisher!;
-  const limit = Math.min(Math.max(Math.trunc(Number(req.query.limit)) || 20, 1), 100);
+  const rawLimit = req.query.limit;
+  const rawAfter = req.query.after;
+
+  // Reject repeated / object params.
+  if (Array.isArray(rawLimit) || (typeof rawLimit === "object" && rawLimit !== null)) {
+    throw new AppError("VALIDATION_ERROR", "limit must be a single value");
+  }
+  if (Array.isArray(rawAfter) || (typeof rawAfter === "object" && rawAfter !== null)) {
+    throw new AppError("VALIDATION_ERROR", "after must be a single value");
+  }
+
+  const DELIVERY_MAX_LIMIT = 100;
+  const DELIVERY_DEFAULT_LIMIT = 20;
+
+  let limit = DELIVERY_DEFAULT_LIMIT;
+  if (rawLimit !== undefined) {
+    const parsed = Math.trunc(Number(rawLimit as string));
+    if (!Number.isFinite(parsed) || parsed < 1 || parsed > DELIVERY_MAX_LIMIT) {
+      throw new AppError("VALIDATION_ERROR", `limit must be between 1 and ${DELIVERY_MAX_LIMIT}`);
+    }
+    limit = parsed;
+  }
+
+  // Decode and validate the after cursor when provided.
+  let cursorCondition: ReturnType<typeof and> | undefined;
+  if (rawAfter !== undefined) {
+    const cursor = rawAfter as string;
+    let decoded: { t: Date; id: string } | null = null;
+    try {
+      const raw = Buffer.from(cursor, "base64url").toString("utf8");
+      const parsed = JSON.parse(raw) as unknown;
+      if (
+        typeof parsed === "object" &&
+        parsed !== null &&
+        typeof (parsed as Record<string, unknown>).t === "string" &&
+        typeof (parsed as Record<string, unknown>).id === "string"
+      ) {
+        const t = new Date((parsed as Record<string, unknown>).t as string);
+        if (!isNaN(t.getTime())) {
+          decoded = { t, id: (parsed as Record<string, unknown>).id as string };
+        }
+      }
+    } catch {
+      // fall through to null check
+    }
+    if (!decoded) {
+      throw new AppError("VALIDATION_ERROR", "Invalid pagination cursor");
+    }
+    // Seek past (decoded.t, decoded.id) with DESC ordering.
+    cursorCondition = or(
+      lt(webhookOutbox.createdAt, decoded.t),
+      and(
+        lte(webhookOutbox.createdAt, decoded.t),
+        lt(webhookOutbox.id, decoded.id),
+      ),
+    );
+  }
 
   const rows = await db
     .select({
@@ -407,11 +474,25 @@ router.get("/publishers/me/webhooks/deliveries", apiKeyAuth, publisherRateLimit,
       createdAt: webhookOutbox.createdAt,
     })
     .from(webhookOutbox)
-    .where(eq(webhookOutbox.publisherId, pub.id))
-    .orderBy(desc(webhookOutbox.createdAt))
-    .limit(limit);
+    .where(
+      cursorCondition
+        ? and(eq(webhookOutbox.publisherId, pub.id), cursorCondition)
+        : eq(webhookOutbox.publisherId, pub.id),
+    )
+    .orderBy(desc(webhookOutbox.createdAt), desc(webhookOutbox.id))
+    .limit(limit + 1);
 
-  res.json({ deliveries: rows });
+  const hasNextPage = rows.length > limit;
+  const pageRows = hasNextPage ? rows.slice(0, limit) : rows;
+  const lastRow = pageRows[pageRows.length - 1];
+
+  let nextCursor: string | null = null;
+  if (hasNextPage && lastRow) {
+    const payload = JSON.stringify({ t: lastRow.createdAt!.toISOString(), id: lastRow.id });
+    nextCursor = Buffer.from(payload).toString("base64url");
+  }
+
+  res.json({ deliveries: pageRows, nextCursor, hasNextPage });
 });
 
 // POST /publishers/me/webhooks/deliveries/:id/replay — replay a failed webhook delivery (#156)
