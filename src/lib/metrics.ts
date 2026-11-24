@@ -66,6 +66,36 @@ export const cacheMisses = new Counter({
   registers: [metricsRegistry],
 });
 
+// DB query and connection-acquisition latency (#219)
+//
+// `db_query_duration_seconds` — time from when the query is submitted to the
+//   pool until the last result row is received. High values indicate slow
+//   queries or index scans that need attention.
+//
+// `db_pool_acquire_duration_seconds` — time spent waiting for a free
+//   connection before the query can begin. High values indicate pool
+//   saturation: the pool cap is too low for the current concurrency or queries
+//   are holding connections for too long.
+//
+// Label cardinality is bounded: `operation` must be one of a fixed set of
+// coarse-grained names (e.g. "select", "insert", "update", "delete",
+// "other"). Never pass a raw query string or a row ID as a label.
+export const dbQueryDuration = new Histogram({
+  name: "db_query_duration_seconds",
+  help: "Database query execution time in seconds (from submit to last result row)",
+  labelNames: ["operation"] as const,
+  buckets: [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5],
+  registers: [metricsRegistry],
+});
+
+export const dbPoolAcquireDuration = new Histogram({
+  name: "db_pool_acquire_duration_seconds",
+  help: "Time spent waiting for a free connection from the pool before a query can begin",
+  labelNames: ["operation"] as const,
+  buckets: [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5],
+  registers: [metricsRegistry],
+});
+
 // Webhook Outbox Metrics (#158)
 // Operational measurements specifically for persistent delivery health.
 // Note: Intentionally exported without publisher-ID labels to prevent high cardinality.
